@@ -10,7 +10,7 @@
 #
 set -euo pipefail
 
-VERSION=0.1.0
+VERSION=0.1.1
 # Resolve symlinks so the tool works when installed as a symlink on $PATH (it needs base/ and proxy/).
 here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
@@ -140,7 +140,7 @@ ensure_infra() { # <allowed-host>...
   if ! { [[ "$running" == "$image" ]] && docker ps --format '{{.Names}}' | grep -qx "$proxy"; }; then
     docker rm -f "$proxy" >/dev/null 2>&1 || true
     # --dns is explicit because the proxy also sits on an --internal net, which breaks docker's embedded DNS.
-    docker run -d --name "$proxy" --network "$NET_WAN" --dns 1.1.1.1 --dns 8.8.8.8 "$image" >/dev/null
+    docker run -d --name "$proxy" --network "$NET_WAN" --cap-add NET_ADMIN --dns 1.1.1.1 --dns 8.8.8.8 "$image" >/dev/null
     docker network connect "$lan" "$proxy" >/dev/null  # give it a foot on the box's LAN too
   fi
 
