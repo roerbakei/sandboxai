@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+#
+# sandboxai — run an agent (or a shell) in a locked box: only your project, only web egress.
+# Help:  sandboxai --help     Version:  sandboxai --version
+#
+# What the box can and can't do — host-enforced, so the agent inside can't switch any of it off:
+#   - sees only PATH (+ --mount, - --exclude)  : nothing else on your disk
+#   - empty $HOME, only a scoped Claude login  : no ssh keys, no aws creds, no ssh-agent, no host env
+#   - web egress through a filtering proxy only : no raw TCP, so no SSH/database reach to prod
+#
+set -euo pipefail
+
+VERSION=0.1.0
+# Resolve symlinks so the tool works when installed as a symlink on $PATH (it needs base/ and proxy/).
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+
+# Docker objects we manage, all named sandboxai_* so teardown can find them.
+# Per-policy egress isolation is explained at policy_id() / ensure_infra().
+NET_WAN=sandboxai_wan          # proxy's internet-facing network (shared, not --internal)
+CLAUDE_VOL=sandboxai_claude    # read-only SEED for the box home (login + config + skills), shared across repos
+PROJ_VOL_PREFIX=sandboxai_proj # one persistent memory volume per repo (the only writable state besides /work)
+BOX_HOME=/home/agent           # box runs as uid 1000 with this HOME; the home itself is ephemeral, see run_box
+
+usage() {
+  cat <<EOF
+sandboxai $VERSION — run an agent (or a shell) in a locked box: only your project, only web egress.
+
+USAGE:
+  sandboxai <command> [PATH] [OPTIONS] [-- ARGS...]
+
+COMMANDS:
+  claude [PATH]        run claude in the box over PATH (default: current dir)
+  gemini [PATH]        run gemini in the box
+  bash   [PATH]        open a shell in the box
+  <cmd>  [PATH]        run any command available inside the box
+  reseed               refresh the box login from your host (keeps history & settings)
+  teardown             remove the proxy, networks, and the seeded login volume
+
+OPTIONS (for the run commands; --flag value and --flag=value both work):
+  --exclude=PATH       hide a file/dir inside the shared project (repeatable)
+  --mount=PATH[:DEST]  also mount an extra host dir into the box (repeatable). DEST defaults to
+                       /mnt/<basename> and must be absolute; mounted read-write, outside /work.
+  --allow-network=HOST restrict egress to ONLY these hosts + subdomains, deny the rest (repeatable).
+                       Without any, every web host is reachable (raw TCP is always blocked).
+  --dockerfile=FILE    build the box from FILE (write it 'FROM sandboxai/base') instead of the
+                       repo's .sandboxai/Dockerfile — for extra tools / system packages
+  -- ARGS...           pass everything after -- verbatim to the command in the box
+
+GLOBAL:
+  -h, --help           show this help
+  -V, --version        show the version
+
+AUTH:
+  No host env crosses into the box. Each agent authenticates from its host LOGIN, seeded in once:
+  claude from ~/.claude (sanitized), gemini from ~/.gemini. Log in on the host, then run sandboxai;
+  use 'sandboxai reseed' after re-logging in. Set SANDBOXAI_EPHEMERAL_AUTH=1 to also strip Claude's
+  refresh token (you re-auth periodically).
+
+The box home is EPHEMERAL — wiped each run. Two things persist: your project PATH (mounted at /work) and
+a per-repo memory volume at ~/.claude/projects. The login, config, and skills are seeded read-only each
+launch from one shared volume (sandboxai_claude).
+EOF
+}
+
+# =================================================================================================
+# Images
+# =================================================================================================
+
+build_images() {
+  build_if_missing sandboxai/proxy "$here/proxy" "proxy image"
+  build_if_missing sandboxai/base  "$here/base"  "base image (~1-2 min)"
+}
+
+build_if_missing() { # <tag> <context-dir> <label>
+  docker image inspect "$1" >/dev/null 2>&1 && return 0
+  echo "sandboxai: building $3 (first run)…" >&2
+  docker build -q -t "$1" "$2" >/dev/null
+}
+
+# The image to actually run: plain base, or — if a Dockerfile is supplied (--dockerfile or the repo's
+# .sandboxai/Dockerfile) — a per-repo image built from it (cached by content hash). That Dockerfile may
+# go root and use the network at BUILD time; the RUNTIME container is still forced non-root with locked
+# egress (see run_box), so a custom image can never widen the boundary. Prints the tag.
+resolve_image() { # <path> [dockerfile]
+  local path="$1" dockerfile="${2:-$path/.sandboxai/Dockerfile}"
+  [[ -f "$dockerfile" ]] || { echo sandboxai/base; return; }
+  local ctx; ctx="$(cd "$(dirname "$dockerfile")" && pwd)"  # build context = the Dockerfile's dir, so COPY works
+  local base_id; base_id="$(docker image inspect -f '{{.Id}}' sandboxai/base 2>/dev/null)"
+  local tag="sandboxai/custom:$({ printf '%s|' "$base_id"; cat "$dockerfile"; } | sha256sum | cut -c1-12)"
+  if ! docker image inspect "$tag" >/dev/null 2>&1; then
+    echo "sandboxai: building this repo's custom toolchain (cached after first build)…" >&2
+    docker build -q -t "$tag" -f "$dockerfile" "$ctx" >/dev/null
+  fi
+  echo "$tag"
+}
+
+# The proxy image to run: plain sandboxai/proxy (allow every web host), or — if --allow-network was
+# given — a variant that denies everything except the named hosts and their subdomains. Cached by the
+# resulting config so repeated runs with the same allowlist are instant. Prints the tag.
+proxy_image() { # <allowed-host>...
+  [[ $# -eq 0 ]] && { echo sandboxai/proxy; return; }
+  local ctx; ctx="$(mktemp -d)"
+  cp "$here/proxy/tinyproxy.conf" "$ctx/tinyproxy.conf"
+  printf '\nFilterDefaultDeny On\nFilter "/etc/tinyproxy/filter"\nFilterExtended On\n' >> "$ctx/tinyproxy.conf"
+  local host
+  for host in "$@"; do printf '(^|\\.)%s$\n' "${host//./\\.}" >> "$ctx/filter"; done  # match host + subdomains
+  printf 'FROM sandboxai/proxy\nCOPY tinyproxy.conf /etc/tinyproxy/tinyproxy.conf\nCOPY filter /etc/tinyproxy/filter\n' > "$ctx/Dockerfile"
+  local tag="sandboxai/proxy:$(cat "$ctx/tinyproxy.conf" "$ctx/filter" | sha256sum | cut -c1-12)"
+  docker image inspect "$tag" >/dev/null 2>&1 || docker build -q -t "$tag" "$ctx" >/dev/null
+  rm -rf "$ctx"
+  echo "$tag"
+}
+
+# =================================================================================================
+# Network: a proxy bridging the box's dead-end LAN to the internet, nothing else
+# =================================================================================================
+
+# A stable id for an egress policy: "open" for no allowlist, else a hash of the sorted hosts. Same policy
+# → same id → same reused LAN+proxy; different policy → fully separate infra. Order-independent.
+policy_id() { # <allowed-host>...
+  [[ $# -eq 0 ]] && { echo open; return; }
+  printf '%s\n' "$@" | sort -u | sha256sum | cut -c1-12
+}
+
+# Bring up (or reuse) the LAN + proxy for THIS policy. Prints "<lan-name> <proxy-ip>" for run_box to wire
+# the box onto. Each policy's proxy is independent, so concurrent boxes with different allowlists don't
+# interfere. The proxy IP is whatever docker assigned on the LAN — discovered, not hardcoded; gVisor's
+# broken embedded DNS doesn't matter because the box dials this IP directly via HTTP(S)_PROXY.
+ensure_infra() { # <allowed-host>...
+  local id; id="$(policy_id "$@")"
+  local lan="sandboxai_lan_${id}" proxy="sandboxai_proxy_${id}"
+  local image; image="$(proxy_image "$@")"
+
+  docker network inspect "$NET_WAN" >/dev/null 2>&1 || docker network create "$NET_WAN" >/dev/null
+  docker network inspect "$lan"     >/dev/null 2>&1 || docker network create --internal "$lan" >/dev/null
+
+  # Reuse the running proxy only if it's already this policy's image; recreate if missing/stale. Since the
+  # image is deterministic from the policy, a same-policy box never triggers a recreate (no churn/bleed).
+  local running; running="$(docker inspect -f '{{.Config.Image}}' "$proxy" 2>/dev/null || true)"
+  if ! { [[ "$running" == "$image" ]] && docker ps --format '{{.Names}}' | grep -qx "$proxy"; }; then
+    docker rm -f "$proxy" >/dev/null 2>&1 || true
+    # --dns is explicit because the proxy also sits on an --internal net, which breaks docker's embedded DNS.
+    docker run -d --name "$proxy" --network "$NET_WAN" --dns 1.1.1.1 --dns 8.8.8.8 "$image" >/dev/null
+    docker network connect "$lan" "$proxy" >/dev/null  # give it a foot on the box's LAN too
+  fi
+
+  local ip; ip="$(docker inspect -f "{{(index .NetworkSettings.Networks \"$lan\").IPAddress}}" "$proxy")"
+  printf '%s %s\n' "$lan" "$ip"
+}
+
+# =================================================================================================
+# Box-side agent home: seeded once with the host logins, re-synced each launch with skills/plugins
+# =================================================================================================
+
+# Seed each agent's host LOGIN into the box ONCE (no API keys are ever forwarded). Once-only because tokens
+# refresh box-side and re-copying would clobber them — use `reseed` to force. Claude's config + credential
+# are sanitized first (strip_*); on failure we seed none of the credential (fail closed). Gemini's ~/.gemini
+# is copied as-is. Any missing host login → that agent just comes up unauthenticated.
+ensure_box_auth() {
+  local force="${1:-}"
+  [[ -z "$force" ]] && docker volume inspect "$CLAUDE_VOL" >/dev/null 2>&1 && return 0
+  docker volume create "$CLAUDE_VOL" >/dev/null 2>&1 || true
+
+  local cfg; cfg="$(strip_host_config "$HOME/.claude.json")"
+  local cred; cred="$(strip_credential "$HOME/.claude/.credentials.json")"
+  [[ -f "$HOME/.claude/.credentials.json" && -z "$cred" ]] \
+    && echo "sandboxai: could not sanitize the claude credential — seeding none (claude won't be logged in)" >&2
+
+  local -a seed=(-v "$cfg":/seed_cfg:ro)
+  [[ -n "$cred" ]]            && seed+=(-v "$cred":/seed_cred:ro)
+  [[ -d "$HOME/.gemini" ]]    && seed+=(-v "$HOME/.gemini":/seed_gemini:ro)
+  docker run --rm -v "$CLAUDE_VOL":/c "${seed[@]}" alpine:3.20 sh -c '
+    mkdir -p /c/.claude
+    cp /seed_cfg /c/.claude.json
+    [ -f /seed_cred ]   && cp /seed_cred /c/.claude/.credentials.json
+    [ -d /seed_gemini ] && { rm -rf /c/.gemini; cp -a /seed_gemini /c/.gemini; }
+    chown -R 1000 /c'
+  rm -f "$cfg" "$cred"
+}
+
+# ~/.claude.json minus bulky/host-only/secret keys; benign UX state (theme, folder-trust, onboarding) is
+# kept so the box doesn't re-prompt. Denylist not allowlist: an allowlist looks safer but silently drops
+# folder-trust/login state and breaks on every new UX key claude ships. The real secret, mcpServers, is
+# denied. Prints a tmpfile path (always succeeds).
+strip_host_config() { # <host-config>
+  local out; out="$(mktemp)"
+  python3 - "$1" "$out" <<'PY' 2>/dev/null || echo '{"hasCompletedOnboarding":true}' >"$out"
+import json, sys
+d = json.load(open(sys.argv[1]))
+for k in ("projects", "mcpServers", "tipsHistory", "history",
+          "installMethod", "autoUpdates", "autoUpdatesProtectedForNative"):
+    d.pop(k, None)
+d["hasCompletedOnboarding"] = True
+json.dump(d, open(sys.argv[2], "w"))
+PY
+  echo "$out"
+}
+
+# The credential with third-party tokens (mcpOAuth) always stripped, and the Claude refresh token too
+# under SANDBOXAI_EPHEMERAL_AUTH=1. Prints a tmpfile path, or nothing if there's no credential / it fails.
+strip_credential() { # <host-credential>
+  [[ -f "$1" ]] || return 0
+  local out; out="$(mktemp)"
+  python3 - "$1" "$out" "${SANDBOXAI_EPHEMERAL_AUTH:-0}" <<'PY' 2>/dev/null || { rm -f "$out"; return 0; }
+import json, sys
+d = json.load(open(sys.argv[1]))
+d.pop("mcpOAuth", None)
+if sys.argv[3] == "1":
+    o = d.get("claudeAiOauth")
+    if isinstance(o, dict): o.pop("refreshToken", None)
+json.dump(d, open(sys.argv[2], "w"))
+PY
+  echo "$out"
+}
+
+# Mirror the host's CURRENT skills/plugins into the box every launch (copies, never live-mounts), so a
+# newly installed one shows up next launch with no reseed. Plugins also need their enablement flag and a
+# path fixup: their config records absolute host paths that don't exist under the box's /home/agent.
+sync_claude_extras() {
+  local -a mounts=()
+  [[ -d "$HOME/.claude/skills" ]]   && mounts+=(-v "$HOME/.claude/skills":/seed_skills:ro)
+  [[ -d "$HOME/.claude/plugins" ]]  && mounts+=(-v "$HOME/.claude/plugins":/seed_plugins:ro)
+  [[ -f "$HOME/.claude/CLAUDE.md" ]] && mounts+=(-v "$HOME/.claude/CLAUDE.md":/seed_claudemd:ro)
+  local settings; settings="$(extract_enabled_plugins "$HOME/.claude/settings.json")"
+  [[ -n "$settings" ]] && mounts+=(-v "$settings":/seed_settings:ro)
+  [[ ${#mounts[@]} -eq 0 ]] && return 0  # host has nothing to sync
+
+  docker run --rm -e HOST_HOME="$HOME" -e BOX_HOME="$BOX_HOME" \
+    -v "$CLAUDE_VOL":/c "${mounts[@]}" alpine:3.20 sh -c '
+    mkdir -p /c/.claude
+    [ -d /seed_skills ] && { rm -rf /c/.claude/skills; cp -a /seed_skills /c/.claude/skills; }
+    if [ -d /seed_plugins ]; then
+      rm -rf /c/.claude/plugins
+      cp -a /seed_plugins /c/.claude/plugins
+      [ -n "$HOST_HOME" ] && [ "$HOST_HOME" != "$BOX_HOME" ] \
+        && find /c/.claude/plugins -type f -name "*.json" -exec sed -i "s|$HOST_HOME|$BOX_HOME|g" {} +
+    fi
+    [ -f /seed_settings ] && cp /seed_settings /c/.claude/settings.json
+    [ -f /seed_claudemd ] && cp /seed_claudemd /c/.claude/CLAUDE.md
+    chown -R 1000 /c/.claude'
+  rm -f "$settings"
+}
+
+# Just the enabledPlugins key from settings.json (the rest can hold host-specific hooks/env we won't
+# import). Prints a tmpfile path, or nothing if no plugins are enabled.
+extract_enabled_plugins() { # <host-settings>
+  [[ -f "$1" ]] || return 0
+  local out; out="$(mktemp)"
+  python3 - "$1" "$out" <<'PY' 2>/dev/null || { rm -f "$out"; return 0; }
+import json, sys
+src = json.load(open(sys.argv[1]))
+ep = src.get("enabledPlugins")
+if not (isinstance(ep, dict) and ep): sys.exit(1)
+json.dump({"enabledPlugins": ep}, open(sys.argv[2], "w"))
+PY
+  echo "$out"
+}
+
+# One persistent volume per repo for ~/.claude/projects (memory/history) — the box's only writable state
+# besides /work. Per-repo so repos can't read each other's memory (every box runs at /work, so a shared
+# volume would mix them). It holds data claude reads back as context, never code it executes. Prints the name.
+ensure_project_vol() { # <absolute-path>
+  local hash; hash="$(printf '%s' "$1" | sha256sum | cut -c1-12)"
+  local vol="${PROJ_VOL_PREFIX}_${hash}"
+  if ! docker volume inspect "$vol" >/dev/null 2>&1; then
+    docker volume create "$vol" >/dev/null 2>&1 || true
+    docker run --rm -v "$vol":/p alpine:3.20 sh -c 'chown 1000 /p' >/dev/null 2>&1 || true  # uid 1000 must own it
+  fi
+  echo "$vol"
+}
+
+# =================================================================================================
+# Launch
+# =================================================================================================
+
+# gVisor is REQUIRED, not best-effort: it virtualizes /proc + /sys so the box can't fingerprint the
+# host kernel/hardware. Fail closed — a silent fallback to plain docker would reopen that leak unnoticed.
+require_runsc() {
+  command -v runsc >/dev/null 2>&1 && return 0
+  echo "sandboxai: gVisor runtime 'runsc' not found — refusing to launch without it." >&2
+  echo "  install: https://gvisor.dev/docs/user_guide/install/" >&2
+  echo "  then:    sudo runsc install && sudo systemctl restart docker" >&2
+  return 1
+}
+
+run_box() {
+  local cmd="$1"; shift
+  local path="." dockerfile=""
+  local -a excludes=() allow=() cmdargs=() mountdirs=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --exclude=*)        excludes+=("${1#*=}"); shift ;;
+      --exclude)          excludes+=("$2"); shift 2 ;;
+      --mount=*)          mountdirs+=("${1#*=}"); shift ;;
+      --mount)            mountdirs+=("$2"); shift 2 ;;
+      --allow-network=*)  allow+=("${1#*=}"); shift ;;
+      --allow-network)    allow+=("$2"); shift 2 ;;
+      --dockerfile=*)     dockerfile="${1#*=}"; shift ;;
+      --dockerfile)       dockerfile="$2"; shift 2 ;;
+      --)                 shift; cmdargs=("$@"); break ;;
+      -*)                 echo "sandboxai: unknown option '$1' (see --help)" >&2; exit 2 ;;
+      *)                  path="$1"; shift ;;
+    esac
+  done
+  path="$(cd "$path" && pwd)"
+  [[ -n "$dockerfile" && ! -f "$dockerfile" ]] && { echo "sandboxai: --dockerfile '$dockerfile' not found" >&2; exit 2; }
+
+  # Share the project read-write (the agent's edits must flow back); blank out each --exclude on top.
+  local -a mounts=(-v "$path:/work")
+  local e
+  for e in ${excludes[@]+"${excludes[@]}"}; do
+    if [[ -d "$path/$e" ]]; then mounts+=(--tmpfs "/work/$e"); else mounts+=(-v /dev/null:"/work/$e:ro"); fi
+  done
+
+  # Extra host dirs, each at /mnt/<basename> unless an absolute :DEST is given. Widens the box's view
+  # on purpose — that's what was asked. Read-write like /work; these live outside the repo's memory.
+  local m src dest
+  for m in ${mountdirs[@]+"${mountdirs[@]}"}; do
+    src="${m%%:*}"; dest="${m#*:}"
+    [[ "$dest" == "$m" ]] && dest="/mnt/$(basename "$src")"     # no :DEST given → default
+    src="$(cd "$src" 2>/dev/null && pwd)" || { echo "sandboxai: --mount '${m%%:*}' not found" >&2; exit 2; }
+    [[ "$dest" == /* ]] || { echo "sandboxai: --mount DEST '$dest' must be absolute" >&2; exit 2; }
+    mounts+=(-v "$src:$dest")
+  done
+
+  ensure_box_auth
+  sync_claude_extras
+  # Login/config/skills are seeded READ-ONLY into /seed; the launch wrapper copies them into the box's
+  # own overlay home, which is EPHEMERAL (gone on --rm). So a compromised agent can't plant hooks, skills,
+  # or dotfiles that survive to re-run in a later box. The ONLY writable state that persists is /work and
+  # the per-repo memory volume below — data claude reads back as context, never code it executes.
+  mounts+=(-v "$CLAUDE_VOL":/seed:ro)
+  mounts+=(-v "$(ensure_project_vol "$path")":/home/agent/.claude/projects)
+
+  require_runsc || exit 1
+  build_images
+  local lan proxy_ip
+  read -r lan proxy_ip < <(ensure_infra ${allow[@]+"${allow[@]}"})    # this box's own policy-scoped LAN + proxy
+  local proxy_url="http://${proxy_ip}:8888"
+  local image; image="$(resolve_image "$path" "$dockerfile")"
+
+  local -a tty=(-i); [[ -t 0 ]] && tty=(-it)                         # interactive only when we have a terminal
+
+  # No host env crosses in (forwarding API keys would read as phishy and break "empty $HOME"). The
+  # agents authenticate from their host LOGINS, seeded into the box volume by ensure_box_auth.
+  exec docker run --rm "${tty[@]}" --runtime=runsc \
+    --label sandboxai --network "$lan" --hostname sandbox \
+    --user agent -e HOME=/home/agent \
+    -e HTTP_PROXY="$proxy_url" -e HTTPS_PROXY="$proxy_url" -e NO_PROXY=localhost,127.0.0.1 \
+    -e DISABLE_AUTOUPDATER=1 \
+    --cap-drop ALL --security-opt no-new-privileges \
+    "${mounts[@]}" -w /work \
+    "$image" sh -c 'cp -a /seed/. "$HOME/" 2>/dev/null || true; exec "$@"' _ "$cmd" ${cmdargs[@]+"${cmdargs[@]}"}
+}
+
+teardown() {
+  # Box containers first — a still-running or crashed (un---rm'd) box holds the login volume and would
+  # make its removal fail silently. They're labelled sandboxai so we can find the otherwise-unnamed ones.
+  docker ps -aq --filter 'label=sandboxai' | xargs -r docker rm -f >/dev/null 2>&1 || true
+  docker ps -aq --filter 'name=sandboxai_proxy_' | xargs -r docker rm -f >/dev/null 2>&1 || true
+  docker network ls --format '{{.Name}}' 2>/dev/null | grep -E '^sandboxai_lan_' \
+    | xargs -r docker network rm >/dev/null 2>&1 || true
+  docker network rm "$NET_WAN" >/dev/null 2>&1 || true
+  # Report the login volume explicitly — a swallowed failure here is exactly the "teardown didn't log
+  # me out" surprise. Next agent launch re-seeds it from your host login, so this is the box's copy only.
+  if ! docker volume inspect "$CLAUDE_VOL" >/dev/null 2>&1; then
+    echo "sandboxai: login volume already gone."
+  elif docker volume rm "$CLAUDE_VOL" >/dev/null 2>&1; then
+    echo "sandboxai: removed box login volume ($CLAUDE_VOL). Re-seeds from your host login on next launch."
+  else
+    echo "sandboxai: could NOT remove $CLAUDE_VOL — a container still uses it. Run 'sandboxai teardown' again." >&2
+  fi
+  # drop the per-repo toolchain images and per-allowlist proxy images we built (cheap to rebuild)
+  docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+    | grep -E '^sandboxai/custom:|^sandboxai/proxy:[0-9a-f]{12}$' \
+    | xargs -r docker rmi -f >/dev/null 2>&1 || true
+  # Per-repo memory volumes are KEPT on purpose (user data). List: docker volume ls -q | grep '^sandboxai_proj_'
+}
+
+case "${1:-}" in
+  -h|--help|help)       usage ;;
+  -V|--version|version) echo "sandboxai $VERSION" ;;
+  "")                   usage >&2; exit 2 ;;
+  reseed)               ensure_box_auth force && echo "sandboxai: re-seeded the box logins (claude + gemini) from your host." ;;
+  teardown)             teardown ;;
+  *)                    run_box "$@" ;;
+esac
