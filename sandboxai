@@ -10,7 +10,7 @@
 #
 set -euo pipefail
 
-VERSION=0.1.1
+VERSION=0.1.2
 # Resolve symlinks so the tool works when installed as a symlink on $PATH (it needs base/ and proxy/).
 here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
@@ -134,10 +134,14 @@ ensure_infra() { # <allowed-host>...
   docker network inspect "$NET_WAN" >/dev/null 2>&1 || docker network create "$NET_WAN" >/dev/null
   docker network inspect "$lan"     >/dev/null 2>&1 || docker network create --internal "$lan" >/dev/null
 
-  # Reuse the running proxy only if it's already this policy's image; recreate if missing/stale. Since the
-  # image is deterministic from the policy, a same-policy box never triggers a recreate (no churn/bleed).
-  local running; running="$(docker inspect -f '{{.Config.Image}}' "$proxy" 2>/dev/null || true)"
-  if ! { [[ "$running" == "$image" ]] && docker ps --format '{{.Names}}' | grep -qx "$proxy"; }; then
+  # Reuse the running proxy only if it's already this policy's image; recreate if missing/stale. Compare
+  # by image ID, not tag: `make build` moves the tag to a new ID but the running container keeps the old
+  # one, so a tag-string match would silently reuse a pre-rebuild proxy (e.g. one without the egress
+  # firewall). Since the image is deterministic from the policy, a same-policy box with an up-to-date
+  # image never triggers a recreate (no churn/bleed).
+  local want; want="$(docker image inspect -f '{{.Id}}' "$image" 2>/dev/null || true)"
+  local running; running="$(docker inspect -f '{{.Image}}' "$proxy" 2>/dev/null || true)"
+  if ! { [[ -n "$want" && "$running" == "$want" ]] && docker ps --format '{{.Names}}' | grep -qx "$proxy"; }; then
     docker rm -f "$proxy" >/dev/null 2>&1 || true
     # --dns is explicit because the proxy also sits on an --internal net, which breaks docker's embedded DNS.
     docker run -d --name "$proxy" --network "$NET_WAN" --cap-add NET_ADMIN --dns 1.1.1.1 --dns 8.8.8.8 "$image" >/dev/null
