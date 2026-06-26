@@ -10,7 +10,7 @@
 #
 set -euo pipefail
 
-VERSION=0.1.2
+VERSION=0.1.3
 # Resolve symlinks so the tool works when installed as a symlink on $PATH (it needs base/ and proxy/).
 here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
@@ -94,16 +94,25 @@ resolve_image() { # <path> [dockerfile]
   echo "$tag"
 }
 
+# Hosts the agent's own control plane needs no matter what: its API and its OAuth login. These aren't a
+# discretionary egress grant — they're the precondition for the agent running at all, so an
+# --allow-network list that omitted them would just brick the very agent it wraps (api → "403 Filtered",
+# login → "Socket is closed"). Merged into every non-empty allowlist. Covers both agents this tool
+# launches; harmless when only one is in use since everything else is still denied. Override/extend with
+# SANDBOXAI_AGENT_HOSTS="host1 host2".
+AGENT_HOSTS=(${SANDBOXAI_AGENT_HOSTS:-anthropic.com claude.ai googleapis.com accounts.google.com})
+
 # The proxy image to run: plain sandboxai/proxy (allow every web host), or — if --allow-network was
-# given — a variant that denies everything except the named hosts and their subdomains. Cached by the
-# resulting config so repeated runs with the same allowlist are instant. Prints the tag.
+# given — a variant that denies everything except the named hosts (+ the agent's own control plane) and
+# their subdomains. Cached by the resulting config so repeated runs with the same allowlist are instant.
+# Prints the tag.
 proxy_image() { # <allowed-host>...
   [[ $# -eq 0 ]] && { echo sandboxai/proxy; return; }
   local ctx; ctx="$(mktemp -d)"
   cp "$here/proxy/tinyproxy.conf" "$ctx/tinyproxy.conf"
   printf '\nFilterDefaultDeny On\nFilter "/etc/tinyproxy/filter"\nFilterExtended On\n' >> "$ctx/tinyproxy.conf"
   local host
-  for host in "$@"; do printf '(^|\\.)%s$\n' "${host//./\\.}" >> "$ctx/filter"; done  # match host + subdomains
+  for host in "${AGENT_HOSTS[@]}" "$@"; do printf '(^|\\.)%s$\n' "${host//./\\.}" >> "$ctx/filter"; done  # match host + subdomains
   printf 'FROM sandboxai/proxy\nCOPY tinyproxy.conf /etc/tinyproxy/tinyproxy.conf\nCOPY filter /etc/tinyproxy/filter\n' > "$ctx/Dockerfile"
   local tag="sandboxai/proxy:$(cat "$ctx/tinyproxy.conf" "$ctx/filter" | sha256sum | cut -c1-12)"
   docker image inspect "$tag" >/dev/null 2>&1 || docker build -q -t "$tag" "$ctx" >/dev/null
