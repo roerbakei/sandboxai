@@ -10,7 +10,7 @@
 #
 set -euo pipefail
 
-VERSION=0.1.3
+VERSION=0.1.4
 # Resolve symlinks so the tool works when installed as a symlink on $PATH (it needs base/ and proxy/).
 here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
@@ -37,7 +37,9 @@ COMMANDS:
   teardown             remove the proxy, networks, and the seeded login volume
 
 OPTIONS (for the run commands; --flag value and --flag=value both work):
-  --exclude=PATH       hide a file/dir inside the shared project (repeatable)
+  --exclude=PATH       hide a file/dir inside the shared project (repeatable). A git-tracked PATH is
+                       marked --skip-worktree in the box so a routine `git add -A` won't commit the mask;
+                       undo on the host with: git update-index --no-skip-worktree PATH
   --mount=PATH[:DEST]  also mount an extra host dir into the box (repeatable). DEST defaults to
                        /mnt/<basename> and must be absolute; mounted read-write, outside /work.
   --allow-network=HOST restrict egress to ONLY these hosts + subdomains, deny the rest (repeatable).
@@ -318,11 +320,14 @@ run_box() {
   path="$(cd "$path" && pwd)"
   [[ -n "$dockerfile" && ! -f "$dockerfile" ]] && { echo "sandboxai: --dockerfile '$dockerfile' not found" >&2; exit 2; }
 
-  # Share the project read-write (the agent's edits must flow back); blank out each --exclude on top.
+  # Share the project read-write (the agent's edits must flow back); mask each --exclude on top. The mask
+  # makes git see the tracked path as deleted, so the wrapper marks excludes --skip-worktree (see below) —
+  # else a routine `git add -A` would commit the mask and lose the real file on the next host checkout.
   local -a mounts=(-v "$path:/work")
-  local e
+  local e exclude_list=""
   for e in ${excludes[@]+"${excludes[@]}"}; do
     if [[ -d "$path/$e" ]]; then mounts+=(--tmpfs "/work/$e"); else mounts+=(-v /dev/null:"/work/$e:ro"); fi
+    exclude_list+="$e"$'\n'
   done
 
   # Extra host dirs, each at /mnt/<basename> unless an absolute :DEST is given. Widens the box's view
@@ -361,9 +366,21 @@ run_box() {
     --user agent -e HOME=/home/agent \
     -e HTTP_PROXY="$proxy_url" -e HTTPS_PROXY="$proxy_url" -e NO_PROXY=localhost,127.0.0.1 \
     -e DISABLE_AUTOUPDATER=1 \
+    -e SANDBOXAI_EXCLUDES="$exclude_list" \
     --cap-drop ALL --security-opt no-new-privileges \
     "${mounts[@]}" -w /work \
-    "$image" sh -c 'cp -a /seed/. "$HOME/" 2>/dev/null || true; exec "$@"' _ "$cmd" ${cmdargs[@]+"${cmdargs[@]}"}
+    "$image" sh -c '
+      cp -a /seed/. "$HOME/" 2>/dev/null || true
+      # Hide masked --excludes from git so a routine "git add -A" cannot commit the mask (see run_box).
+      if [ -n "$SANDBOXAI_EXCLUDES" ] && [ -e /work/.git ]; then
+        git config --global --add safe.directory /work 2>/dev/null || true
+        printf %s "$SANDBOXAI_EXCLUDES" | while IFS= read -r e; do
+          [ -n "$e" ] || continue
+          git -C /work ls-files -z -- "$e" 2>/dev/null \
+            | xargs -0 -r git -C /work update-index --skip-worktree 2>/dev/null || true
+        done
+      fi
+      exec "$@"' _ "$cmd" ${cmdargs[@]+"${cmdargs[@]}"}
 }
 
 teardown() {
