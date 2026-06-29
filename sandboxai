@@ -10,7 +10,7 @@
 #
 set -euo pipefail
 
-VERSION=0.1.4
+VERSION=0.1.5
 # Resolve symlinks so the tool works when installed as a symlink on $PATH (it needs base/ and proxy/).
 here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
@@ -133,6 +133,18 @@ policy_id() { # <allowed-host>...
   printf '%s\n' "$@" | sort -u | sha256sum | cut -c1-12
 }
 
+# A deterministic /24 for a network, pinned inside 10.200.0.0/16. Without an explicit --subnet docker
+# allocates from its default pool, which rolls into 192.168.0.0/16 once the 172.x blocks fill up — and
+# that range collides with the typical home/office LAN (192.168.x), so the bridge steals the host's own
+# gateway IP and blackholes its internet. 10.200.x is off any default LAN, matching the recommended
+# daemon-level default-address-pools. Override the base if it clashes with a VPN/corp 10.x range.
+# ponytail: 256 /24 slots (one hash byte); a same-byte collision makes `docker network create` fail
+# loudly (contained) rather than break the host — widen to two octets if real deployments hit it.
+SANDBOXAI_NET_BASE=${SANDBOXAI_NET_BASE:-10.200}
+net_subnet() { # <network-name> -> 10.<base>.<n>.0/24
+  printf '%s.%d.0/24\n' "$SANDBOXAI_NET_BASE" "$(( 0x$(printf '%s' "$1" | sha256sum | cut -c1-2) ))"
+}
+
 # Bring up (or reuse) the LAN + proxy for THIS policy. Prints "<lan-name> <proxy-ip>" for run_box to wire
 # the box onto. Each policy's proxy is independent, so concurrent boxes with different allowlists don't
 # interfere. The proxy IP is whatever docker assigned on the LAN — discovered, not hardcoded; gVisor's
@@ -142,8 +154,8 @@ ensure_infra() { # <allowed-host>...
   local lan="sandboxai_lan_${id}" proxy="sandboxai_proxy_${id}"
   local image; image="$(proxy_image "$@")"
 
-  docker network inspect "$NET_WAN" >/dev/null 2>&1 || docker network create "$NET_WAN" >/dev/null
-  docker network inspect "$lan"     >/dev/null 2>&1 || docker network create --internal "$lan" >/dev/null
+  docker network inspect "$NET_WAN" >/dev/null 2>&1 || docker network create --subnet "$(net_subnet "$NET_WAN")" "$NET_WAN" >/dev/null
+  docker network inspect "$lan"     >/dev/null 2>&1 || docker network create --internal --subnet "$(net_subnet "$lan")" "$lan" >/dev/null
 
   # Reuse the running proxy only if it's already this policy's image; recreate if missing/stale. Compare
   # by image ID, not tag: `make build` moves the tag to a new ID but the running container keeps the old
