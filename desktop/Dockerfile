@@ -7,7 +7,7 @@ USER root
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      xvfb x11vnc novnc websockify openbox xterm dbus-x11 \
+      xvfb x11vnc novnc websockify openbox tint2 xterm dbus-x11 gnome-keyring libsecret-1-0 \
       fonts-dejavu-core libasound2t64 libatk-bridge2.0-0t64 libcups2t64 libgbm1 libgtk-3-0t64 \
       libnss3 libxkbcommon0 libxdamage1 libxcomposite1 libxrandr2 libxss1 \
  && rm -rf /var/lib/apt/lists/*
@@ -18,6 +18,20 @@ RUN echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/claude-desktop-archive-k
       > /etc/apt/sources.list.d/claude-desktop.list \
  && apt-get update && apt-get install -y --no-install-recommends claude-desktop \
  && rm -rf /var/lib/apt/lists/*
+
+# A real browser, because both apps sign you in by handing a URL to xdg-open — without one the login just
+# sits on "Awaiting Authentication". Ubuntu's own firefox/chromium packages are snap stubs that cannot run in
+# a container. Firefox from Mozilla's apt repo installs fine but dies instantly under gVisor
+# ("wasm_rt_syscall_set_segue_base error: Invalid argument" — its RLBox sandbox needs a syscall runsc does not
+# implement), so this is Chrome: the same Chromium the two Electron apps already run on in here.
+RUN curl -fsSL https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -o /tmp/chrome.deb \
+ && apt-get update && apt-get install -y --no-install-recommends /tmp/chrome.deb xdg-utils \
+ && rm -f /tmp/chrome.deb && rm -rf /var/lib/apt/lists/*
+
+# xdg-open execs $BROWSER with no chance to add flags, and bare chrome cannot start here — same dropped
+# capabilities and same missing proxy env as the Electron apps. This wrapper is what $BROWSER points at.
+COPY browser.sh /usr/local/bin/sandboxai-browser
+RUN chmod 0755 /usr/local/bin/sandboxai-browser
 
 # Antigravity ships no repo, only a versioned tarball. Bump this ARG to upgrade; the URLs are listed on
 # https://antigravity.google/download (the page is gzipped JS, so read it with `curl --compressed`).

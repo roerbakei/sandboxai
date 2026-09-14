@@ -32,6 +32,7 @@ DESKTOP_CREDS=(
   ".config/Antigravity/Cookies"
   ".config/Antigravity/Local Storage"
   ".gemini/antigravity/installation_id"
+  ".local/share/keyrings"
 )
 
 usage() {
@@ -45,7 +46,8 @@ COMMANDS:
   claude [PATH]        run claude in the box over PATH (default: current dir)
   gemini [PATH]        run gemini in the box
   agy    [PATH]        run the antigravity CLI in the box
-  desktop [PATH]       run Claude Desktop + Antigravity on a boxed desktop; prints a noVNC URL to open
+  desktop [APP] [PATH] run the GUI apps on a boxed desktop; prints a noVNC URL to open. APP is 'claude'
+                       or 'antigravity'; without it you get both, side by side on the taskbar
   bash   [PATH]        open a shell in the box
   <cmd>  [PATH]        run any command available inside the box
   reseed               refresh the box login from your host (keeps history & settings)
@@ -61,6 +63,8 @@ OPTIONS (for the run commands; --flag value and --flag=value both work):
                        Without any, every web host is reachable (raw TCP is always blocked).
   --dockerfile=FILE    build the box from FILE (write it 'FROM sandboxai/base') instead of the
                        repo's .sandboxai/Dockerfile — for extra tools / system packages
+  --app=NAME           'desktop' only: start just this app — claude or antigravity (repeatable).
+                       Without it you get both, side by side on the taskbar.
   -- ARGS...           pass everything after -- verbatim to the command in the box
 
 GLOBAL:
@@ -345,6 +349,16 @@ ensure_desktop_auth() {
   docker volume create "$DESKTOP_VOL" >/dev/null 2>&1 || true   # exists even when the host had nothing, so we seed once
 }
 
+# The box's keyring password, generated once and kept for the life of the volume — a fresh one each run
+# would lock the box out of the very keyring it harvested last time, which is the "I have to log in again
+# every restart" bug in a different costume.
+ensure_keyring_password() {
+  docker volume create "$DESKTOP_VOL" >/dev/null 2>&1 || true
+  docker run --rm -v "$DESKTOP_VOL":/d alpine:3.20 sh -c '
+    [ -s /d/.sandboxai-keyring-pass ] || head -c 18 /dev/urandom | base64 > /d/.sandboxai-keyring-pass
+    chown 1000 /d/.sandboxai-keyring-pass && chmod 600 /d/.sandboxai-keyring-pass' >/dev/null
+}
+
 # After the desktop box EXITS, copy the allowlisted credential files back out of it. Host-side and
 # fixed-path on purpose: the box never writes to the volume, so it cannot smuggle anything into the next run.
 harvest_desktop_creds() { # <container>
@@ -375,9 +389,16 @@ require_runsc() {
 run_box() {
   local cmd="$1"; shift
   local path="." dockerfile=""
-  local -a excludes=() allow=() cmdargs=() mountdirs=()
+  local -a excludes=() allow=() cmdargs=() mountdirs=() apps=()
+
+  # 'sandboxai desktop claude' reads better than '--app=claude', so an app name is allowed right after
+  # 'desktop'. Only there, and only an exact app name — anything else in that slot is still the PATH.
+  [[ "$cmd" == desktop && ( "${1:-}" == claude || "${1:-}" == antigravity ) ]] && { apps+=("$1"); shift; }
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --app=*)            apps+=("${1#*=}"); shift ;;
+      --app)              apps+=("$2"); shift 2 ;;
       --exclude=*)        excludes+=("${1#*=}"); shift ;;
       --exclude)          excludes+=("$2"); shift 2 ;;
       --mount=*)          mountdirs+=("${1#*=}"); shift ;;
@@ -426,10 +447,15 @@ run_box() {
   local -a desktop_env=()
   if [[ -n "$desktop" ]]; then
     ensure_desktop_auth
+    ensure_keyring_password
     mounts+=(-v "$DESKTOP_VOL":/seed_desktop:ro)
     vnc_password="$(head -c 12 /dev/urandom | base64 | tr -d '/+=' | cut -c1-8)"
-    desktop_env=(-e SANDBOXAI_VNC_PASSWORD="$vnc_password")
+    # docker's default 64MB /dev/shm is where chromium renderers die — a blank white window, no error.
+    desktop_env=(--shm-size=1g
+                 -e SANDBOXAI_VNC_PASSWORD="$vnc_password"
+                 -e SANDBOXAI_DESKTOP_APPS="${apps[*]:-claude antigravity}")
   fi
+  [[ -z "$desktop" && ${#apps[@]} -gt 0 ]] && { echo "sandboxai: --app only applies to 'sandboxai desktop'" >&2; exit 2; }
   # Login/config/skills are seeded READ-ONLY into /seed; the launch wrapper copies them into the box's
   # own overlay home, which is EPHEMERAL (gone on --rm). So a compromised agent can't plant hooks, skills,
   # or dotfiles that survive to re-run in a later box. The ONLY writable state that persists is /work and
