@@ -21,6 +21,8 @@ install at all? Run `./setup.sh` once and call `./sandboxai` from the clone. Rem
 ```
 sandboxai claude [PATH]     # run claude in the locked box over PATH (default: current dir)
 sandboxai gemini [PATH]     # run gemini instead
+sandboxai agy    [PATH]     # run the antigravity CLI
+sandboxai desktop [PATH]    # Claude Desktop + Antigravity on a boxed desktop, opened over noVNC
 sandboxai bash   [PATH]     # poke around inside
 sandboxai reseed            # refresh the box logins from your host (keeps history & settings)
 sandboxai teardown          # remove proxy, networks, seeded login volume
@@ -35,10 +37,19 @@ sandboxai claude . --dockerfile=ci/box.Dockerfile      # extra tools, FROM sandb
 sandboxai claude . -- --model opus                     # everything after -- goes to the command
 ```
 
-**Agents & auth.** `claude` and `gemini` are baked in; run any other agent by adding it in a
-`--dockerfile`. **No API keys or host env are forwarded** — each agent authenticates from its host
-login, copied into the box once: `~/.claude` (sanitized) for claude, `~/.gemini` for gemini. Log in on
-the host first; after re-logging in, run `sandboxai reseed`.
+**Agents & auth.** `claude`, `gemini` and `agy` (antigravity) are baked in; run any other agent by
+adding it in a `--dockerfile`. **No API keys or host env are forwarded** — each agent authenticates
+from its host login, copied into the box once: `~/.claude` (sanitized) for claude, `~/.gemini` for
+gemini. Log in on the host first; after re-logging in, run `sandboxai reseed`.
+
+**The desktop.** `sandboxai desktop` starts a throwaway X server in the box running **Claude Desktop**
+and **Antigravity**, and prints a `http://<box-ip>:6080/vnc.html` URL plus a one-shot VNC password —
+open it in your browser. Your host X/Wayland socket is never mounted, so the box cannot see, key-log or
+screenshot anything outside itself. You can log in to the GUI apps *inside* the box and it sticks: on
+exit the launcher copies a **fixed, host-side list of credential files** back out (cookies and local
+storage — never `claude_desktop_config.json`, settings, hooks or skills). The box never writes to that
+volume and cannot widen the list, so the ephemeral-home guarantee below still holds. `Ctrl-C` shuts the
+desktop down.
 
 ## The guarantees
 
@@ -71,8 +82,9 @@ the host first; after re-logging in, run `sandboxai reseed`.
 
 ## Toolchain inside the box
 
-The base image is **deliberately minimal** — just enough for a working agent: **Node** (the agent
-CLIs run on it), **claude** and **gemini**, the **`python3` interpreter + stdlib** (the agent's go-to
+The base image is **deliberately minimal** — just enough for a working agent: **Ubuntu 24.04**, **Node**
+(gemini-cli runs on it), the native **claude** and **agy** binaries, **gemini**, the **`python3`
+interpreter + stdlib** (the agent's go-to
 for ad-hoc file scripting), **git**, and TLS roots. **Library dependencies** still just work — the box
 installs them through the locked egress; HTTPS to package mirrors goes through the proxy, raw protocols
 don't leave.
@@ -113,17 +125,20 @@ everywhere. Memory volumes survive `teardown` on purpose; list them with
 sandboxai          # the launcher — builds infra, applies the lock, runs the box
 Makefile           # make install / uninstall (symlink onto PATH)
 setup.sh           # one-time host preflight + image build
-base/Dockerfile    # the box image: node + claude + gemini + python3 + git, empty-home non-root user
+base/Dockerfile    # the box image: ubuntu + node + claude/agy binaries + gemini + python3 + git, empty-home non-root user
+desktop/           # the GUI layer (FROM sandboxai/base): Xvfb + openbox + noVNC, Claude Desktop, Antigravity
 proxy/             # tinyproxy: the entire egress policy, ~20 auditable lines
 ```
 
 ## FAQ
 
-**The login URL inside the box isn't clickable / I can't copy it.** Don't log in from inside the box.
-The box can't reach your host clipboard (it has no display server, and mounting one in would expose your
-desktop), and the long URL wraps so it won't select cleanly. Instead, log in on the **host** —
+**The login URL inside the box isn't clickable / I can't copy it.** Don't log in from inside a headless
+box. It can't reach your host clipboard (it has no display server, and mounting your host's in would
+expose your whole desktop), and the long URL wraps so it won't select cleanly. Instead, log in on the
+**host** —
 `claude` then `/login`, finish in your normal browser — then `sandboxai reseed` and relaunch. The box
-comes up already authenticated and never shows the prompt.
+comes up already authenticated and never shows the prompt. (`sandboxai desktop` is the exception — it
+has its own display and browser, so logging in there works and is kept.)
 
 **Why does a login prompt show up at all if I'm logged in on the host?** Your host login is seeded into
 the box once. If it still prompts, either you haven't logged in on the host yet (do that, then

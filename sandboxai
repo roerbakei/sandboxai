@@ -10,7 +10,7 @@
 #
 set -euo pipefail
 
-VERSION=0.1.5
+VERSION=0.2.0
 # Resolve symlinks so the tool works when installed as a symlink on $PATH (it needs base/ and proxy/).
 here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
@@ -18,8 +18,21 @@ here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 # Per-policy egress isolation is explained at policy_id() / ensure_infra().
 NET_WAN=sandboxai_wan          # proxy's internet-facing network (shared, not --internal)
 CLAUDE_VOL=sandboxai_claude    # read-only SEED for the box home (login + config + skills), shared across repos
+DESKTOP_VOL=sandboxai_desktop  # read-only SEED for the GUI apps' logins; written ONLY host-side, see harvest_desktop_creds
 PROJ_VOL_PREFIX=sandboxai_proj # one persistent memory volume per repo (the only writable state besides /work)
 BOX_HOME=/home/agent           # box runs as uid 1000 with this HOME; the home itself is ephemeral, see run_box
+
+# The ONLY paths that survive a desktop run. Deliberately just the credential blobs chromium and sqlite read
+# back — never claude_desktop_config.json (mcpServers), settings, hooks or skills, which are CODE the next
+# box would execute. The list lives host-side and the box can neither read nor widen it, so the box home
+# stays as ephemeral as the headless one: a compromised desktop plants nothing that runs next launch.
+DESKTOP_CREDS=(
+  ".config/Claude/Cookies"
+  ".config/Claude/Local Storage"
+  ".config/Antigravity/Cookies"
+  ".config/Antigravity/Local Storage"
+  ".gemini/antigravity/installation_id"
+)
 
 usage() {
   cat <<EOF
@@ -31,6 +44,8 @@ USAGE:
 COMMANDS:
   claude [PATH]        run claude in the box over PATH (default: current dir)
   gemini [PATH]        run gemini in the box
+  agy    [PATH]        run the antigravity CLI in the box
+  desktop [PATH]       run Claude Desktop + Antigravity on a boxed desktop; prints a noVNC URL to open
   bash   [PATH]        open a shell in the box
   <cmd>  [PATH]        run any command available inside the box
   reseed               refresh the box login from your host (keeps history & settings)
@@ -61,6 +76,12 @@ AUTH:
 The box home is EPHEMERAL — wiped each run. Two things persist: your project PATH (mounted at /work) and
 a per-repo memory volume at ~/.claude/projects. The login, config, and skills are seeded read-only each
 launch from one shared volume (sandboxai_claude).
+
+DESKTOP:
+  'sandboxai desktop' runs the GUI apps on a throwaway X server and prints a noVNC URL plus a one-shot
+  password — open it in your browser. Log in inside the box once and it sticks: on exit the launcher copies
+  a FIXED list of credential files out (see DESKTOP_CREDS). Nothing else survives, so the ephemeral home
+  guarantee above still holds. Ctrl-C to shut the desktop down.
 EOF
 }
 
@@ -68,9 +89,11 @@ EOF
 # Images
 # =================================================================================================
 
-build_images() {
+build_images() { # [desktop]
   build_if_missing sandboxai/proxy "$here/proxy" "proxy image"
   build_if_missing sandboxai/base  "$here/base"  "base image (~1-2 min)"
+  [[ -n "${1:-}" ]] && build_if_missing sandboxai/desktop "$here/desktop" "desktop image (~3-5 min)"
+  return 0
 }
 
 build_if_missing() { # <tag> <context-dir> <label>
@@ -102,7 +125,7 @@ resolve_image() { # <path> [dockerfile]
 # login → "Socket is closed"). Merged into every non-empty allowlist. Covers both agents this tool
 # launches; harmless when only one is in use since everything else is still denied. Override/extend with
 # SANDBOXAI_AGENT_HOSTS="host1 host2".
-AGENT_HOSTS=(${SANDBOXAI_AGENT_HOSTS:-anthropic.com claude.ai googleapis.com accounts.google.com})
+AGENT_HOSTS=(${SANDBOXAI_AGENT_HOSTS:-anthropic.com claude.ai googleapis.com accounts.google.com google.com gstatic.com})
 
 # The proxy image to run: plain sandboxai/proxy (allow every web host), or — if --allow-network was
 # given — a variant that denies everything except the named hosts (+ the agent's own control plane) and
@@ -296,6 +319,45 @@ ensure_project_vol() { # <absolute-path>
   echo "$vol"
 }
 
+# Copy a staging dir (laid out like the box home) into DESKTOP_VOL, owned by uid 1000. Merges, so each
+# harvest updates only what it captured and leaves the rest of the seed intact.
+push_desktop_seed() { # <staging-dir>
+  docker volume create "$DESKTOP_VOL" >/dev/null 2>&1 || true
+  docker run --rm -v "$DESKTOP_VOL":/d -v "$1":/staging:ro alpine:3.20 \
+    sh -c 'cp -a /staging/. /d/ && chown -R 1000 /d' >/dev/null
+}
+
+# Seed the GUI logins from your host ONCE, using the same allowlist the harvest uses — so your host's
+# claude_desktop_config.json (mcpServers: arbitrary commands) never crosses into the box either.
+ensure_desktop_auth() {
+  local force="${1:-}"
+  [[ -z "$force" ]] && docker volume inspect "$DESKTOP_VOL" >/dev/null 2>&1 && return 0
+  local staging; staging="$(mktemp -d)"
+  local p found=""
+  for p in "${DESKTOP_CREDS[@]}"; do
+    [[ -e "$HOME/$p" ]] || continue
+    mkdir -p "$staging/$(dirname "$p")"
+    cp -a "$HOME/$p" "$staging/$p"
+    found=1
+  done
+  [[ -n "$found" ]] && push_desktop_seed "$staging"
+  rm -rf "$staging"
+  docker volume create "$DESKTOP_VOL" >/dev/null 2>&1 || true   # exists even when the host had nothing, so we seed once
+}
+
+# After the desktop box EXITS, copy the allowlisted credential files back out of it. Host-side and
+# fixed-path on purpose: the box never writes to the volume, so it cannot smuggle anything into the next run.
+harvest_desktop_creds() { # <container>
+  local staging; staging="$(mktemp -d)"
+  local p found=""
+  for p in "${DESKTOP_CREDS[@]}"; do
+    mkdir -p "$staging/$(dirname "$p")"
+    docker cp "$1:$BOX_HOME/$p" "$staging/$p" >/dev/null 2>&1 && found=1
+  done
+  [[ -n "$found" ]] && push_desktop_seed "$staging"
+  rm -rf "$staging"
+}
+
 # =================================================================================================
 # Launch
 # =================================================================================================
@@ -353,8 +415,21 @@ run_box() {
     mounts+=(-v "$src:$dest")
   done
 
+  # `desktop` is not a program in the box — it's a session (X server, WM, the two GUI apps, noVNC). It runs
+  # the desktop image and, unlike every other command, outlives this function's exec so the launcher is still
+  # around to harvest the logins afterwards (see below).
+  local desktop=""; [[ "$cmd" == desktop ]] && { desktop=1; cmd=sandboxai-desktop; }
+
   ensure_box_auth
   sync_claude_extras
+  local vnc_password=""
+  local -a desktop_env=()
+  if [[ -n "$desktop" ]]; then
+    ensure_desktop_auth
+    mounts+=(-v "$DESKTOP_VOL":/seed_desktop:ro)
+    vnc_password="$(head -c 12 /dev/urandom | base64 | tr -d '/+=' | cut -c1-8)"
+    desktop_env=(-e SANDBOXAI_VNC_PASSWORD="$vnc_password")
+  fi
   # Login/config/skills are seeded READ-ONLY into /seed; the launch wrapper copies them into the box's
   # own overlay home, which is EPHEMERAL (gone on --rm). So a compromised agent can't plant hooks, skills,
   # or dotfiles that survive to re-run in a later box. The ONLY writable state that persists is /work and
@@ -363,26 +438,39 @@ run_box() {
   mounts+=(-v "$(ensure_project_vol "$path")":/home/agent/.claude/projects)
 
   require_runsc || exit 1
-  build_images
+  build_images "$desktop"
   local lan proxy_ip
   read -r lan proxy_ip < <(ensure_infra ${allow[@]+"${allow[@]}"})    # this box's own policy-scoped LAN + proxy
   local proxy_url="http://${proxy_ip}:8888"
   local image; image="$(resolve_image "$path" "$dockerfile")"
+  if [[ -n "$desktop" && "$image" != sandboxai/base ]]; then
+    echo "sandboxai: this repo builds its own image, which has no desktop stack — write it 'FROM sandboxai/desktop'." >&2
+  elif [[ -n "$desktop" ]]; then
+    image=sandboxai/desktop
+  fi
 
   local -a tty=(-i); [[ -t 0 ]] && tty=(-it)                         # interactive only when we have a terminal
+  [[ -n "$desktop" ]] && tty=(-d)                                    # a desktop has no stdin; we wait on it instead
 
   # No host env crosses in (forwarding API keys would read as phishy and break "empty $HOME"). The
   # agents authenticate from their host LOGINS, seeded into the box volume by ensure_box_auth.
-  exec docker run --rm "${tty[@]}" --runtime=runsc \
-    --label sandboxai --network "$lan" --hostname sandbox \
-    --user agent -e HOME=/home/agent \
-    -e HTTP_PROXY="$proxy_url" -e HTTPS_PROXY="$proxy_url" -e NO_PROXY=localhost,127.0.0.1 \
-    -e DISABLE_AUTOUPDATER=1 \
-    -e SANDBOXAI_EXCLUDES="$exclude_list" \
-    --cap-drop ALL --security-opt no-new-privileges \
-    "${mounts[@]}" -w /work \
-    "$image" sh -c '
+  # --rm everywhere EXCEPT a desktop run: its container has to survive its own exit long enough for
+  # harvest_desktop_creds to copy the logins out of it. It is removed a few lines below either way.
+  local -a lifecycle=(--rm); [[ -n "$desktop" ]] && lifecycle=()
+  local -a docker_args=(
+    "${lifecycle[@]}" "${tty[@]}" --runtime=runsc
+    --label sandboxai --network "$lan" --hostname sandbox
+    --user agent -e HOME=/home/agent
+    -e HTTP_PROXY="$proxy_url" -e HTTPS_PROXY="$proxy_url" -e NO_PROXY=localhost,127.0.0.1
+    -e DISABLE_AUTOUPDATER=1
+    -e SANDBOXAI_EXCLUDES="$exclude_list"
+    ${desktop_env[@]+"${desktop_env[@]}"}
+    --cap-drop ALL --security-opt no-new-privileges
+    "${mounts[@]}" -w /work
+  )
+  local wrapper='
       cp -a /seed/. "$HOME/" 2>/dev/null || true
+      cp -a /seed_desktop/. "$HOME/" 2>/dev/null || true
       # Hide masked --excludes from git so a routine "git add -A" cannot commit the mask (see run_box).
       if [ -n "$SANDBOXAI_EXCLUDES" ] && [ -e /work/.git ]; then
         git config --global --add safe.directory /work 2>/dev/null || true
@@ -392,7 +480,23 @@ run_box() {
             | xargs -0 -r git -C /work update-index --skip-worktree 2>/dev/null || true
         done
       fi
-      exec "$@"' _ "$cmd" ${cmdargs[@]+"${cmdargs[@]}"}
+      exec "$@"'
+
+  [[ -z "$desktop" ]] && exec docker run "${docker_args[@]}" "$image" sh -c "$wrapper" _ "$cmd" ${cmdargs[@]+"${cmdargs[@]}"}
+
+  local box; box="$(docker run "${docker_args[@]}" "$image" sh -c "$wrapper" _ "$cmd" ${cmdargs[@]+"${cmdargs[@]}"})"
+  # No published port: --internal networks drop those. The host routes to the box's LAN IP directly, which is
+  # why the session is VNC-password-gated — every user on this host can reach that address.
+  local box_ip; box_ip="$(docker inspect -f "{{(index .NetworkSettings.Networks \"$lan\").IPAddress}}" "$box")"
+  cat >&2 <<EOF
+sandboxai: desktop up — open  http://${box_ip}:6080/vnc.html
+           VNC password: ${vnc_password}
+           Ctrl-C to shut it down. Logins you make inside are kept; nothing else is.
+EOF
+  trap 'docker stop -t 10 "$box" >/dev/null 2>&1 || true' INT TERM
+  docker wait "$box" >/dev/null 2>&1 || true
+  harvest_desktop_creds "$box"
+  docker rm -f "$box" >/dev/null 2>&1 || true
 }
 
 teardown() {
@@ -405,13 +509,16 @@ teardown() {
   docker network rm "$NET_WAN" >/dev/null 2>&1 || true
   # Report the login volume explicitly — a swallowed failure here is exactly the "teardown didn't log
   # me out" surprise. Next agent launch re-seeds it from your host login, so this is the box's copy only.
-  if ! docker volume inspect "$CLAUDE_VOL" >/dev/null 2>&1; then
-    echo "sandboxai: login volume already gone."
-  elif docker volume rm "$CLAUDE_VOL" >/dev/null 2>&1; then
-    echo "sandboxai: removed box login volume ($CLAUDE_VOL). Re-seeds from your host login on next launch."
-  else
-    echo "sandboxai: could NOT remove $CLAUDE_VOL — a container still uses it. Run 'sandboxai teardown' again." >&2
-  fi
+  local vol
+  for vol in "$CLAUDE_VOL" "$DESKTOP_VOL"; do
+    if ! docker volume inspect "$vol" >/dev/null 2>&1; then
+      echo "sandboxai: login volume $vol already gone."
+    elif docker volume rm "$vol" >/dev/null 2>&1; then
+      echo "sandboxai: removed box login volume ($vol). Re-seeds from your host login on next launch."
+    else
+      echo "sandboxai: could NOT remove $vol — a container still uses it. Run 'sandboxai teardown' again." >&2
+    fi
+  done
   # drop the per-repo toolchain images and per-allowlist proxy images we built (cheap to rebuild)
   docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
     | grep -E '^sandboxai/custom:|^sandboxai/proxy:[0-9a-f]{12}$' \
@@ -423,7 +530,8 @@ case "${1:-}" in
   -h|--help|help)       usage ;;
   -V|--version|version) echo "sandboxai $VERSION" ;;
   "")                   usage >&2; exit 2 ;;
-  reseed)               ensure_box_auth force && echo "sandboxai: re-seeded the box logins (claude + gemini) from your host." ;;
+  reseed)               ensure_box_auth force; ensure_desktop_auth force
+                        echo "sandboxai: re-seeded the box logins (claude + gemini + the desktop apps) from your host." ;;
   teardown)             teardown ;;
   *)                    run_box "$@" ;;
 esac

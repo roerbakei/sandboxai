@@ -43,6 +43,7 @@ cat <<EOF
 
 setup complete. next:
   ./sandboxai claude .     # run claude in the locked box over the current dir
+  ./sandboxai desktop .    # Claude Desktop + Antigravity on a boxed desktop, opened over noVNC
   ./sandboxai bash   .     # poke around inside the box
   ./sandboxai teardown     # remove proxy, networks, and the seeded claude volume
 EOF
