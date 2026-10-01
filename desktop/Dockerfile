@@ -2,6 +2,13 @@
 # over noVNC. Layered on sandboxai/base rather than merged into it so a headless `sandboxai claude .` never
 # drags ~1GB of desktop around. The RUNTIME boundary is identical to the headless box — non-root, no caps,
 # proxy-only egress, ephemeral $HOME (see run_box in ../sandboxai).
+FROM sandboxai/base AS statx-shim
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \
+ && rm -rf /var/lib/apt/lists/*
+COPY statx_fill.c /statx_fill.c
+RUN gcc -shared -fPIC -O2 -o /statx_fill.so /statx_fill.c -ldl
+
 FROM sandboxai/base
 USER root
 
@@ -39,6 +46,9 @@ ARG ANTIGRAVITY_URL=https://storage.googleapis.com/antigravity-public/antigravit
 RUN mkdir -p /opt/antigravity \
  && curl -fsSL "$ANTIGRAVITY_URL" | tar -xz --strip-components=1 -C /opt/antigravity \
  && ln -sf /opt/antigravity/antigravity /usr/local/bin/antigravity
+
+COPY --from=statx-shim /statx_fill.so /usr/local/lib/sandboxai/statx_fill.so
+RUN echo /usr/local/lib/sandboxai/statx_fill.so > /etc/ld.so.preload
 
 COPY session.sh /usr/local/bin/sandboxai-desktop
 RUN chmod 0755 /usr/local/bin/sandboxai-desktop
