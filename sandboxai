@@ -35,6 +35,22 @@ DESKTOP_CREDS=(
   ".local/share/keyrings"
 )
 
+BOX_WRAPPER='
+  cp -a /seed/. "$HOME/" 2>/dev/null || true
+  cp -a /seed_desktop/. "$HOME/" 2>/dev/null || true
+  # A masked --exclude makes git see the tracked path as deleted, so a routine "git add -A" would commit the
+  # mask. Ask the repo that owns each path (the project root is often just a folder of repos), not /work.
+  if [ -n "$SANDBOXAI_EXCLUDES" ]; then
+    git config --global --add safe.directory "*" 2>/dev/null || true
+    printf %s "$SANDBOXAI_EXCLUDES" | while IFS= read -r e; do
+      [ -n "$e" ] || continue
+      d="/work/$(dirname "$e")"; f="$(basename "$e")"
+      git -C "$d" ls-files -z -- "$f" 2>/dev/null \
+        | xargs -0 -r git -C "$d" update-index --skip-worktree 2>/dev/null || true
+    done
+  fi
+  exec "$@"'
+
 usage() {
   cat <<EOF
 sandboxai $VERSION — run an agent (or a shell) in a locked box: only your project, only web egress.
@@ -54,9 +70,10 @@ COMMANDS:
   teardown             remove the proxy, networks, and the seeded login volume
 
 OPTIONS (for the run commands; --flag value and --flag=value both work):
-  --exclude=PATH       hide a file/dir inside the shared project (repeatable). A git-tracked PATH is
-                       marked --skip-worktree in the box so a routine `git add -A` won't commit the mask;
-                       undo on the host with: git update-index --no-skip-worktree PATH
+  --exclude=PATH       hide a file/dir inside the shared project (repeatable); PATH must exist. A git-tracked
+                       PATH is marked --skip-worktree, in whichever repo owns it, so a routine \`git add -A\`
+                       won't commit the mask; undo on the host, in that repo, with:
+                       git update-index --no-skip-worktree PATH
   --mount=PATH[:DEST]  also mount an extra host dir into the box (repeatable). DEST defaults to
                        /mnt/<basename> and must be absolute; mounted read-write, outside /work.
   --allow-network=HOST restrict egress to ONLY these hosts + subdomains, deny the rest (repeatable).
@@ -416,11 +433,12 @@ run_box() {
   [[ -n "$dockerfile" && ! -f "$dockerfile" ]] && { echo "sandboxai: --dockerfile '$dockerfile' not found" >&2; exit 2; }
 
   # Share the project read-write (the agent's edits must flow back); mask each --exclude on top. The mask
-  # makes git see the tracked path as deleted, so the wrapper marks excludes --skip-worktree (see below) —
+  # makes git see the tracked path as deleted, so the wrapper marks excludes --skip-worktree (see BOX_WRAPPER) —
   # else a routine `git add -A` would commit the mask and lose the real file on the next host checkout.
   local -a mounts=(-v "$path:/work")
   local e exclude_list=""
   for e in ${excludes[@]+"${excludes[@]}"}; do
+    [[ -e "$path/$e" ]] || { echo "sandboxai: --exclude '$e' not found under $path" >&2; exit 2; }
     if [[ -d "$path/$e" ]]; then mounts+=(--tmpfs "/work/$e"); else mounts+=(-v /dev/null:"/work/$e:ro"); fi
     exclude_list+="$e"$'\n'
   done
@@ -494,23 +512,9 @@ run_box() {
     --cap-drop ALL --security-opt no-new-privileges
     "${mounts[@]}" -w /work
   )
-  local wrapper='
-      cp -a /seed/. "$HOME/" 2>/dev/null || true
-      cp -a /seed_desktop/. "$HOME/" 2>/dev/null || true
-      # Hide masked --excludes from git so a routine "git add -A" cannot commit the mask (see run_box).
-      if [ -n "$SANDBOXAI_EXCLUDES" ] && [ -e /work/.git ]; then
-        git config --global --add safe.directory /work 2>/dev/null || true
-        printf %s "$SANDBOXAI_EXCLUDES" | while IFS= read -r e; do
-          [ -n "$e" ] || continue
-          git -C /work ls-files -z -- "$e" 2>/dev/null \
-            | xargs -0 -r git -C /work update-index --skip-worktree 2>/dev/null || true
-        done
-      fi
-      exec "$@"'
+  [[ -z "$desktop" ]] && exec docker run "${docker_args[@]}" "$image" sh -c "$BOX_WRAPPER" _ "$cmd" ${cmdargs[@]+"${cmdargs[@]}"}
 
-  [[ -z "$desktop" ]] && exec docker run "${docker_args[@]}" "$image" sh -c "$wrapper" _ "$cmd" ${cmdargs[@]+"${cmdargs[@]}"}
-
-  local box; box="$(docker run "${docker_args[@]}" "$image" sh -c "$wrapper" _ "$cmd" ${cmdargs[@]+"${cmdargs[@]}"})"
+  local box; box="$(docker run "${docker_args[@]}" "$image" sh -c "$BOX_WRAPPER" _ "$cmd" ${cmdargs[@]+"${cmdargs[@]}"})"
   # No published port: --internal networks drop those. The host routes to the box's LAN IP directly, which is
   # why the session is VNC-password-gated — every user on this host can reach that address.
   local box_ip; box_ip="$(docker inspect -f "{{(index .NetworkSettings.Networks \"$lan\").IPAddress}}" "$box")"
