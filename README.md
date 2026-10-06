@@ -16,6 +16,9 @@ No root needed: `install` symlinks into `~/.local/bin` (on your PATH by default 
 Keep the clone in place — `sandboxai` resolves its own symlink to find `base/` and `proxy/`. Prefer no
 install at all? Run `./setup.sh` once and call `./sandboxai` from the clone. Remove with `make uninstall`.
 
+Upgrade with `git pull && make build`. The desktop image rebuilds itself on the next `sandboxai desktop`
+whenever `desktop/` or the base image changed.
+
 ## Usage
 
 ```
@@ -130,7 +133,7 @@ sandboxai          # the launcher — builds infra, applies the lock, runs the b
 Makefile           # make install / uninstall (symlink onto PATH)
 setup.sh           # one-time host preflight + image build
 base/Dockerfile    # the box image: ubuntu + node + claude/agy binaries + gemini + python3 + git, empty-home non-root user
-desktop/           # the GUI layer (FROM sandboxai/base): Xvfb + openbox + noVNC, Claude Desktop, Antigravity
+desktop/           # the GUI layer (FROM sandboxai/base): Xvfb + openbox + noVNC, Claude Desktop, Antigravity; built on first `desktop`, cached by content hash
 proxy/             # tinyproxy: the entire egress policy, ~20 auditable lines
 ```
 
