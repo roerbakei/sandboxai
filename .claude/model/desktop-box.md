@@ -7,7 +7,7 @@
       gemini           : npm i -g @google/gemini-cli   (npm-only, no binary release)
       user             : agent uid 1000, HOME=/home/agent
 
-    desktop/Dockerfile -> sandboxai/desktop    FROM sandboxai/base
+    desktop/Dockerfile -> sandboxai/desktop:<hash of desktop/ + base id>, retagged sandboxai/desktop    FROM sandboxai/base
       apt              : xvfb x11vnc novnc websockify openbox + electron libs
       claude-desktop   : apt downloads.claude.ai/claude-desktop/apt/stable
       antigravity gui  : ARG ANTIGRAVITY_URL -> /opt/antigravity

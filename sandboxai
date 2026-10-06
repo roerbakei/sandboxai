@@ -118,8 +118,23 @@ EOF
 build_images() { # [desktop]
   build_if_missing sandboxai/proxy "$here/proxy" "proxy image"
   build_if_missing sandboxai/base  "$here/base"  "base image (~1-2 min)"
-  [[ -n "${1:-}" ]] && build_if_missing sandboxai/desktop "$here/desktop" "desktop image (~3-5 min)"
+  [[ -n "${1:-}" ]] && ensure_desktop_image
   return 0
+}
+
+# Tagged by the content of desktop/ plus the base it builds on, so an upgrade rebuilds it instead of silently
+# running last release's session against this release's launcher. Retagged as plain sandboxai/desktop, which
+# is what the launcher runs and what a repo's 'FROM sandboxai/desktop' resolves.
+ensure_desktop_image() {
+  local tag="sandboxai/desktop:$({ docker image inspect -f '{{.Id}}' sandboxai/base
+    cd "$here/desktop" && find . -type f -exec sha256sum {} + | LC_ALL=C sort; } | sha256sum | cut -c1-12)"
+  if ! docker image inspect "$tag" >/dev/null 2>&1; then
+    echo "sandboxai: building desktop image (~3-5 min)…" >&2
+    docker build -q -t "$tag" "$here/desktop" >/dev/null
+    docker images --format '{{.Repository}}:{{.Tag}}' sandboxai/desktop | grep -E ':[0-9a-f]{12}$' | grep -vxF "$tag" \
+      | xargs -r docker rmi >/dev/null 2>&1 || true
+  fi
+  docker tag "$tag" sandboxai/desktop
 }
 
 build_if_missing() { # <tag> <context-dir> <label>
