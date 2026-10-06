@@ -31,6 +31,7 @@ export DBUS_SESSION_BUS_ADDRESS DBUS_SESSION_BUS_PID
 mkdir -p "$HOME/.local/share/keyrings"
 eval "$(printf '%s' "$(cat "$HOME/.sandboxai-keyring-pass")" | gnome-keyring-daemon --unlock --components=secrets)"
 export GNOME_KEYRING_CONTROL
+sandboxai-safe-storage || echo "sandboxai-desktop: could not restore the Claude key — sign in to Claude Desktop inside the box" >&2
 
 # --proxy-server is load-bearing, not belt-and-braces: chromium IGNORES HTTP_PROXY, so without it both apps
 # come up as a blank white window with no network and the login hangs on "Awaiting Authentication".
@@ -41,7 +42,7 @@ electron_flags="--no-sandbox --disable-gpu --password-store=gnome-libsecret --pr
 
 for app in ${SANDBOXAI_DESKTOP_APPS:-claude antigravity}; do
   case "$app" in
-    claude)      claude-desktop $electron_flags >/dev/null 2>&1 & ;;
+    claude)      claude-desktop $electron_flags "claude://code/new?folder=/work" >/dev/null 2>&1 & ;;
     antigravity) antigravity $electron_flags /work >/dev/null 2>&1 & ;;
     *)           echo "sandboxai-desktop: unknown app '$app'" >&2; exit 2 ;;
   esac

@@ -10,7 +10,7 @@
 #
 set -euo pipefail
 
-VERSION=0.2.0
+VERSION=0.2.1
 # Resolve symlinks so the tool works when installed as a symlink on $PATH (it needs base/ and proxy/).
 here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
@@ -26,14 +26,19 @@ BOX_HOME=/home/agent           # box runs as uid 1000 with this HOME; the home i
 # back — never claude_desktop_config.json (mcpServers), settings, hooks or skills, which are CODE the next
 # box would execute. The list lives host-side and the box can neither read nor widen it, so the box home
 # stays as ephemeral as the headless one: a compromised desktop plants nothing that runs next launch.
-DESKTOP_CREDS=(
-  ".config/Claude/Cookies"
-  ".config/Claude/Local Storage"
+CLAUDE_COOKIES=".config/Claude/Cookies"
+CLAUDE_LOGIN=("$CLAUDE_COOKIES" ".config/Claude/Local Storage")   # follows the host login on every launch
+SEEDED_ONCE_CREDS=(
   ".config/Antigravity/Cookies"
   ".config/Antigravity/Local Storage"
   ".gemini/antigravity/installation_id"
-  ".local/share/keyrings"
 )
+BOX_KEYRING=".local/share/keyrings"                                # box-owned: harvested, never seeded from the host
+DESKTOP_CREDS=("${CLAUDE_LOGIN[@]}" "${SEEDED_ONCE_CREDS[@]}" "$BOX_KEYRING")
+
+CLAUDE_KEYRING_APP=Claude
+CLAUDE_KEYRING_SCHEMA=chrome_libsecret_os_crypt_password_v2
+CLAUDE_KEY_FILE=.sandboxai-claude-safe-storage
 
 BOX_WRAPPER='
   cp -a /seed/. "$HOME/" 2>/dev/null || true
@@ -341,27 +346,71 @@ ensure_project_vol() { # <absolute-path>
 }
 
 # Copy a staging dir (laid out like the box home) into DESKTOP_VOL, owned by uid 1000. Merges, so each
-# harvest updates only what it captured and leaves the rest of the seed intact.
-push_desktop_seed() { # <staging-dir>
+# harvest updates only what it captured and leaves the rest of the seed intact. Paths listed after the
+# staging dir are removed first: a leveldb dir half-merged with another copy of itself is corrupt.
+push_desktop_seed() { # <staging-dir> [path-to-replace]...
+  local staging="$1"; shift
   docker volume create "$DESKTOP_VOL" >/dev/null 2>&1 || true
-  docker run --rm -v "$DESKTOP_VOL":/d -v "$1":/staging:ro alpine:3.20 \
-    sh -c 'cp -a /staging/. /d/ && chown -R 1000 /d' >/dev/null
+  docker run --rm -v "$DESKTOP_VOL":/d -v "$staging":/staging:ro alpine:3.20 \
+    sh -c 'for p; do rm -rf "/d/$p"; done; cp -a /staging/. /d/ && chown -R 1000 /d' _ "$@" >/dev/null
 }
 
-# Seed the GUI logins from your host ONCE, using the same allowlist the harvest uses — so your host's
-# claude_desktop_config.json (mcpServers: arbitrary commands) never crosses into the box either.
+# Claude Desktop encrypts its cookies with a key held in the host keyring, so the copied cookies are noise to
+# a box with a keyring of its own. Carry just that one item — never the keyring — as secret, label and
+# attributes, replayed by desktop/safe-storage.sh. Picked by application, never by label: every electron app
+# labels its key "Chromium Safe Storage". secret-tool prints attributes on stderr, so the attributes are not
+# read back: the query fixes `application`, and the schema line on stdout (or the default) gives the rest.
+stage_claude_safe_storage() { # <staging-dir>
+  command -v secret-tool >/dev/null 2>&1 || { echo "sandboxai: 'secret-tool' not found on the host — sudo apt install libsecret-tools" >&2; return 1; }
+  secret-tool search --all --unlock application "$CLAUDE_KEYRING_APP" 2>/dev/null | python3 -c '
+import os, sys
+out, app, default_schema = sys.argv[1:]
+items, cur = [], None
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if line.startswith("[/"):
+        cur = {}
+        items.append(cur)
+    elif cur is not None and " = " in line:
+        name, value = line.split(" = ", 1)
+        cur[name] = value
+hit = next((i for i in items if i.get("secret")
+            and i.get("schema", default_schema).startswith("chrome_libsecret_os_crypt_password")), None)
+if hit is None:
+    sys.exit(1)
+schema = hit.get("schema", default_schema)
+with os.fdopen(os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+    f.write(hit["secret"] + "\n" + hit.get("label", "Safe Storage") + "\n")
+    f.write(f"application {app}\nxdg:schema {schema}\n")
+' "$1/$CLAUDE_KEY_FILE" "$CLAUDE_KEYRING_APP" "$CLAUDE_KEYRING_SCHEMA"
+}
+
+# The Claude login follows the host on every launch — the box is whoever the host is signed in as right now —
+# but only together with the key that decrypts it: cookies the box can't read would replace a working login
+# with a dead one. Everything else is seeded once, so a login made inside the box survives. Your host's
+# claude_desktop_config.json (mcpServers: arbitrary commands) never crosses into the box either way.
 ensure_desktop_auth() {
   local force="${1:-}"
-  [[ -z "$force" ]] && docker volume inspect "$DESKTOP_VOL" >/dev/null 2>&1 && return 0
   local staging; staging="$(mktemp -d)"
-  local p found=""
-  for p in "${DESKTOP_CREDS[@]}"; do
+  local -a paths=()
+  if [[ -e "$HOME/$CLAUDE_COOKIES" ]]; then
+    if stage_claude_safe_storage "$staging"; then
+      paths+=("${CLAUDE_LOGIN[@]}")
+    else
+      echo "sandboxai: no Claude Desktop key (application=$CLAUDE_KEYRING_APP) readable in your host keyring — the box could not read your Claude Desktop login, so it is not copied. Sign in inside the box." >&2
+    fi
+  fi
+  if [[ -n "$force" ]] || ! docker volume inspect "$DESKTOP_VOL" >/dev/null 2>&1; then
+    paths+=("${SEEDED_ONCE_CREDS[@]}")
+  fi
+  local p; local -a staged=()
+  for p in ${paths[@]+"${paths[@]}"}; do
     [[ -e "$HOME/$p" ]] || continue
     mkdir -p "$staging/$(dirname "$p")"
     cp -a "$HOME/$p" "$staging/$p"
-    found=1
+    staged+=("$p")
   done
-  [[ -n "$found" ]] && push_desktop_seed "$staging"
+  [[ ${#staged[@]} -gt 0 ]] && push_desktop_seed "$staging" "${staged[@]}"
   rm -rf "$staging"
   docker volume create "$DESKTOP_VOL" >/dev/null 2>&1 || true   # exists even when the host had nothing, so we seed once
 }

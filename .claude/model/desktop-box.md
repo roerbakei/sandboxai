@@ -11,13 +11,17 @@
       apt              : xvfb x11vnc novnc websockify openbox + electron libs
       claude-desktop   : apt downloads.claude.ai/claude-desktop/apt/stable
       antigravity gui  : ARG ANTIGRAVITY_URL -> /opt/antigravity
-    desktop/session.sh : Xvfb :0 | openbox | x11vnc -rfbauth | websockify 6080
+    desktop/session.sh : Xvfb :0 | openbox | x11vnc -rfbauth | websockify 6080; apps open /work (claude via claude://code/new?folder=)
 
     sandboxai
       DESKTOP_VOL=sandboxai_desktop            seed source only, :ro at /seed — NEVER mounted in $HOME
-      DESKTOP_CREDS=(...)                      host-fixed allowlist: Cookies, Local Storage,
-                                               state.vscdb, installation_id. No *config.json, no settings.json
-      ensure_desktop_auth()                    seed once from host ~/.config/{Claude,Antigravity}, ~/.gemini/antigravity
+      DESKTOP_CREDS=(...)                      host-fixed allowlist the harvest copies out: Claude/Antigravity Cookies +
+                                               Local Storage, installation_id, box keyring. No *config.json, no settings.json
+      CLAUDE_LOGIN                             follows the host EVERY launch, replaced wholesale, only with its key
+      SEEDED_ONCE_CREDS                        Antigravity etc.: seeded once, then the box's own logins win
+      BOX_KEYRING                              harvested, NEVER seeded from the host
+      stage_claude_safe_storage()              host keyring item application=Claude (chromium schema; its label is just "Chromium Safe Storage") -> .sandboxai-claude-safe-storage
+      desktop/safe-storage.sh                  box side: secret-tool store the item so host cookies decrypt
       harvest_desktop_creds(<container>)       docker cp allowlist out of the EXITED box into DESKTOP_VOL
       desktop [PATH]                           no exec/--rm: docker run --name, wait, harvest, rm; prints URL + VNC password
       teardown()                               also removes DESKTOP_VOL

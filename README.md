@@ -45,11 +45,15 @@ gemini. Log in on the host first; after re-logging in, run `sandboxai reseed`.
 **The desktop.** `sandboxai desktop` starts a throwaway X server in the box running **Claude Desktop**
 and **Antigravity**, and prints a `http://<box-ip>:6080/vnc.html` URL plus a one-shot VNC password —
 open it in your browser. Your host X/Wayland socket is never mounted, so the box cannot see, key-log or
-screenshot anything outside itself. You can log in to the GUI apps *inside* the box and it sticks: on
-exit the launcher copies a **fixed, host-side list of credential files** back out (cookies and local
-storage — never `claude_desktop_config.json`, settings, hooks or skills). The box never writes to that
-volume and cannot widen the list, so the ephemeral-home guarantee below still holds. `Ctrl-C` shuts the
-desktop down.
+screenshot anything outside itself. **Claude Desktop comes up signed in as whoever your host is signed in
+as**, on every launch: the launcher copies your host's Claude cookies and local storage, plus the one
+Claude key from your host keyring that decrypts them (never the keyring itself; needs `secret-tool`,
+`sudo apt install libsecret-tools`). Antigravity,
+and any login you make inside the box, stick instead: on exit the launcher copies a **fixed, host-side list
+of credential files** back out (cookies, local storage and the box's own keyring — never
+`claude_desktop_config.json`, settings, hooks or skills). The box never writes to that volume and cannot
+widen the list, so the ephemeral-home guarantee below still holds. Both apps open your project (`/work`)
+on start; Claude Desktop asks you to trust the workspace first, every launch. `Ctrl-C` shuts the desktop down.
 
 ## The guarantees
 
@@ -138,7 +142,8 @@ expose your whole desktop), and the long URL wraps so it won't select cleanly. I
 **host** —
 `claude` then `/login`, finish in your normal browser — then `sandboxai reseed` and relaunch. The box
 comes up already authenticated and never shows the prompt. (`sandboxai desktop` is the exception — it
-has its own display and browser, so logging in there works and is kept.)
+has its own display and browser, so logging in there works and is kept — except for Claude Desktop, which
+follows your host login each launch.)
 
 **Why does a login prompt show up at all if I'm logged in on the host?** Your host login is seeded into
 the box once. If it still prompts, either you haven't logged in on the host yet (do that, then

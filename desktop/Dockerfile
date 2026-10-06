@@ -47,6 +47,13 @@ RUN mkdir -p /opt/antigravity \
  && curl -fsSL "$ANTIGRAVITY_URL" | tar -xz --strip-components=1 -C /opt/antigravity \
  && ln -sf /opt/antigravity/antigravity /usr/local/bin/antigravity
 
+# Its own layer so the heavy ones above stay cached; fold it into the first apt line next time that one is rebuilt anyway.
+RUN apt-get update && apt-get install -y --no-install-recommends libsecret-tools \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY safe-storage.sh /usr/local/bin/sandboxai-safe-storage
+RUN chmod 0755 /usr/local/bin/sandboxai-safe-storage
+
 COPY --from=statx-shim /statx_fill.so /usr/local/lib/sandboxai/statx_fill.so
 RUN echo /usr/local/lib/sandboxai/statx_fill.so > /etc/ld.so.preload
 
